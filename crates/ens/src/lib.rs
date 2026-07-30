@@ -139,7 +139,7 @@ mod contract {
             /// Returns the address for `node` on the chain identified by `coin_type`.
             ///
             /// The returned bytes are the raw address encoding for that coin type
-            /// (e.g., 20-byte ABI-encoded address for EVM chains, script bytes for Bitcoin).
+            /// (e.g., 20 raw bytes for EVM chains, script bytes for Bitcoin).
             function addr(bytes32 node, uint256 coin_type) view returns (bytes memory);
         }
 
@@ -257,7 +257,7 @@ mod provider {
         /// Resolves an ENS name to a multichain address for the given coin type (ENSIP-11).
         ///
         /// Returns the raw address bytes as stored in the resolver. The encoding varies
-        /// by coin type: 20-byte ABI-encoded address for EVM chains, script bytes for
+        /// by coin type: 20 raw address bytes for EVM chains, script bytes for
         /// Bitcoin, etc. Use constants in [`coin_type`][crate::coin_type] or
         /// [`coin_type::evm_chain`][crate::coin_type::evm_chain] for common coin types.
         async fn resolve_name_for_coin_type(
@@ -419,7 +419,7 @@ mod provider_tests {
     #[tokio::test]
     async fn test_pub_resolver_text() {
         let provider = ProviderBuilder::new()
-            .connect_http("http://reth-ethereum.ithaca.xyz/rpc".parse().unwrap());
+            .connect_http("https://reth-ethereum.ithaca.xyz/rpc".parse().unwrap());
 
         let name = "vitalik.eth";
         let node = namehash(name);
@@ -431,7 +431,7 @@ mod provider_tests {
     #[tokio::test]
     async fn test_pub_resolver_fetching_txt() {
         let provider = ProviderBuilder::new()
-            .connect_http("http://reth-ethereum.ithaca.xyz/rpc".parse().unwrap());
+            .connect_http("https://reth-ethereum.ithaca.xyz/rpc".parse().unwrap());
 
         let res = provider.lookup_txt("vitalik.eth", "avatar").await.unwrap();
         assert_eq!(res, "https://euc.li/vitalik.eth")
