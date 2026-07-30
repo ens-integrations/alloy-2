@@ -144,9 +144,8 @@ mod contract {
         ///
         /// Spec: <https://docs.ens.domains/ensip/23>
         ///
-        /// Note: CCIP Read requires client-side handling of the `OffchainLookup` revert
-        /// (ERC-3668). Alloy does not currently implement this; calls to names that require
-        /// CCIP Read will surface as [`EnsError::Resolve`].
+        /// Provider-based ENS helpers handle `OffchainLookup` reverts using ERC-3668 and
+        /// the ENSIP-21 batch gateway protocol.
         #[sol(rpc)]
         contract UniversalResolver {
             error ResolverNotFound(bytes name);
@@ -217,6 +216,10 @@ mod contract {
         /// Failed to decode the Universal Resolver response.
         #[error("Failed to decode Universal Resolver response")]
         InvalidResponse,
+        /// Failed while performing a CCIP Read request.
+        #[cfg(feature = "provider")]
+        #[error("Failed to perform CCIP Read: {0}")]
+        CcipRead(#[from] alloy_provider::CcipReadError),
     }
 }
 
@@ -227,7 +230,7 @@ mod provider {
         EnsResolver::EnsResolverInstance, UniversalResolver, ENS_UNIVERSAL_RESOLVER_ADDRESS,
     };
     use alloy_primitives::{Address, Bytes, U256};
-    use alloy_provider::{Network, Provider};
+    use alloy_provider::{Network, Provider, ProviderCcipReadExt};
     use alloy_sol_types::{SolCall, SolValue};
 
     /// Extension trait for ENS contract calls.
@@ -291,12 +294,12 @@ mod provider {
             let dns = dns_encode(name)?;
             let calldata = EnsResolver::addrCall { node }.abi_encode();
 
-            let ur = UniversalResolver::new(ENS_UNIVERSAL_RESOLVER_ADDRESS, self);
-            let ret = ur
+            let transaction = UniversalResolver::new(ENS_UNIVERSAL_RESOLVER_ADDRESS, self)
                 .resolve(dns.into(), calldata.into())
-                .call()
-                .await
-                .map_err(EnsError::Resolve)?;
+                .into_transaction_request();
+            let output = self.call_with_ccip_read(transaction).await?;
+            let ret = UniversalResolver::resolveCall::abi_decode_returns(&output)
+                .map_err(|_| EnsError::InvalidResponse)?;
 
             Address::abi_decode(ret.result.as_ref()).map_err(|_| EnsError::InvalidResponse)
         }
@@ -314,23 +317,23 @@ mod provider {
             }
             .abi_encode();
 
-            let ur = UniversalResolver::new(ENS_UNIVERSAL_RESOLVER_ADDRESS, self);
-            let ret = ur
+            let transaction = UniversalResolver::new(ENS_UNIVERSAL_RESOLVER_ADDRESS, self)
                 .resolve(dns.into(), calldata.into())
-                .call()
-                .await
-                .map_err(EnsError::Resolve)?;
+                .into_transaction_request();
+            let output = self.call_with_ccip_read(transaction).await?;
+            let ret = UniversalResolver::resolveCall::abi_decode_returns(&output)
+                .map_err(|_| EnsError::InvalidResponse)?;
 
             Bytes::abi_decode(ret.result.as_ref()).map_err(|_| EnsError::InvalidResponse)
         }
 
         async fn lookup_address(&self, address: &Address) -> Result<String, EnsError> {
-            let ur = UniversalResolver::new(ENS_UNIVERSAL_RESOLVER_ADDRESS, self);
-            let ret = ur
+            let transaction = UniversalResolver::new(ENS_UNIVERSAL_RESOLVER_ADDRESS, self)
                 .reverse(Bytes::copy_from_slice(address.as_slice()), U256::from(coin_type::ETH))
-                .call()
-                .await
-                .map_err(EnsError::Lookup)?;
+                .into_transaction_request();
+            let output = self.call_with_ccip_read(transaction).await?;
+            let ret = UniversalResolver::reverseCall::abi_decode_returns(&output)
+                .map_err(|_| EnsError::InvalidResponse)?;
 
             Ok(ret.name)
         }
@@ -340,12 +343,12 @@ mod provider {
             let dns = dns_encode(name)?;
             let calldata = EnsResolver::textCall { node, key: key.to_string() }.abi_encode();
 
-            let ur = UniversalResolver::new(ENS_UNIVERSAL_RESOLVER_ADDRESS, self);
-            let ret = ur
+            let transaction = UniversalResolver::new(ENS_UNIVERSAL_RESOLVER_ADDRESS, self)
                 .resolve(dns.into(), calldata.into())
-                .call()
-                .await
-                .map_err(EnsError::ResolveTxtRecord)?;
+                .into_transaction_request();
+            let output = self.call_with_ccip_read(transaction).await?;
+            let ret = UniversalResolver::resolveCall::abi_decode_returns(&output)
+                .map_err(|_| EnsError::InvalidResponse)?;
 
             String::abi_decode(ret.result.as_ref()).map_err(|_| EnsError::InvalidResponse)
         }
@@ -433,6 +436,15 @@ mod provider_tests {
 
         let res = provider.resolve_name("ur.integration-tests.eth").await.unwrap();
         assert_eq!(res, address!("0x2222222222222222222222222222222222222222"));
+    }
+
+    #[tokio::test]
+    async fn test_ccip_read_integration() {
+        let provider = ProviderBuilder::new()
+            .connect_http("https://ethereum.reth.rs/rpc".parse().unwrap());
+
+        let res = provider.resolve_name("test.offchaindemo.eth").await.unwrap();
+        assert_ne!(res, Address::ZERO);
     }
 
     #[tokio::test]
