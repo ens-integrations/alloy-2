@@ -16,17 +16,16 @@ use std::str::FromStr;
 
 /// ENS Universal Resolver address (`0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe`).
 ///
-/// The primary entry-point for ENS name resolution. This upgradable proxy,
-/// governed by the ENS DAO, supports wildcard resolvers and CCIP Read (ERC-3668)
-/// for L2 and offchain names.
+/// The primary entry-point for ENS name resolution. Supports wildcard resolvers
+/// and CCIP Read (ERC-3668).
 pub const ENS_UNIVERSAL_RESOLVER_ADDRESS: Address =
     address!("0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe");
 
-/// Coin types for ENS multichain address resolution.
+/// Helpers for ENS multichain coin types.
 ///
-/// Ethereum uses SLIP-0044 coin type `60`. Other EVM-compatible chains follow
-/// ENSIP-11: `coinType = 0x80000000 | chainId`. Use [`evm_chain`][coin_type::evm_chain] to
-/// compute the coin type for any EVM chain ID.
+/// Non-EVM chains use their static SLIP-0044 coin type according to ENSIP-9.
+/// EVM-compatible chains follow ENSIP-11: `coinType = 0x80000000 | chainId`.
+/// Use [`evm_chain`][coin_type::evm_chain] to derive an EVM coin type.
 pub mod coin_type {
     /// Ethereum mainnet (SLIP-0044, coin type 60).
     pub const ETH: u64 = 60;
@@ -35,15 +34,10 @@ pub mod coin_type {
     ///
     /// Chain ID `1` (Ethereum mainnet) returns [`ETH`] (`60`) per SLIP-0044.
     /// All other chains use `0x80000000 | chain_id`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `chain_id >= 0x80000000`.
     pub fn evm_chain(chain_id: u32) -> u64 {
         if chain_id == 1 {
             return ETH;
         }
-        assert!(chain_id < 0x8000_0000, "chain_id out of valid ENSIP-11 range");
         0x8000_0000u64 | u64::from(chain_id)
     }
 }
@@ -126,14 +120,14 @@ mod contract {
             /// Returns the name associated with an ENS node, for reverse records.
             function name(bytes32 node) view returns (string);
 
-            /// Returns the txt record value for the specified key.
+            /// Returns the text record value for the specified key.
             function text(bytes32 node, string calldata key) view virtual returns (string memory);
         }
 
         /// ENS Multicoin Resolver interface (ENSIP-11).
         ///
         /// Provides multichain address resolution. Use with the Universal Resolver and
-        /// coin type constants from [`coin_type`][crate::coin_type].
+        /// coin types from ENSIP-9 or [`coin_type::evm_chain`][crate::coin_type::evm_chain].
         #[sol(rpc)]
         contract EnsMulticoinResolver {
             /// Returns the address for `node` on the chain identified by `coin_type`.
@@ -146,7 +140,7 @@ mod contract {
         /// ENS Universal Resolver (ENSIP-23).
         ///
         /// The single entry-point for all ENS resolution. Handles routing to wildcard
-        /// resolvers and CCIP Read (ERC-3668) for L2 and offchain names.
+        /// resolvers and CCIP Read (ERC-3668).
         ///
         /// Spec: <https://docs.ens.domains/ensip/23>
         ///
@@ -190,7 +184,7 @@ mod contract {
 
             /// Reverse-resolves an address to its primary ENS name.
             ///
-            /// `lookupAddress` is the DNS wire-format encoding of `<addr>.addr.reverse`.
+            /// `lookupAddress` is the raw byte encoding of the address.
             /// `coinType` specifies the chain (use [`coin_type::ETH`] for Ethereum).
             function reverse(bytes calldata lookupAddress, uint256 coinType) external view returns (string memory name, address resolver, address reverseResolver);
 
@@ -214,8 +208,8 @@ mod contract {
         /// Failed to resolve ENS name to an address.
         #[error("Failed to resolve ENS name to an address: {0}")]
         Resolve(alloy_contract::Error),
-        /// Failed to get txt records of ENS name.
-        #[error("Failed to resolve txt record: {0}")]
+        /// Failed to get a text record for an ENS name.
+        #[error("Failed to resolve text record: {0}")]
         ResolveTxtRecord(alloy_contract::Error),
         /// Failed to DNS-encode the ENS name for the Universal Resolver.
         #[error("Failed to DNS-encode ENS name: {0}")]
@@ -229,9 +223,8 @@ mod contract {
 #[cfg(feature = "provider")]
 mod provider {
     use crate::{
-        coin_type, dns_encode, namehash, reverse_address, EnsError, EnsMulticoinResolver,
-        EnsResolver, EnsResolver::EnsResolverInstance, UniversalResolver,
-        ENS_UNIVERSAL_RESOLVER_ADDRESS,
+        coin_type, dns_encode, namehash, EnsError, EnsMulticoinResolver, EnsResolver,
+        EnsResolver::EnsResolverInstance, UniversalResolver, ENS_UNIVERSAL_RESOLVER_ADDRESS,
     };
     use alloy_primitives::{Address, Bytes, U256};
     use alloy_provider::{Network, Provider};
@@ -249,7 +242,7 @@ mod provider {
         /// Performs a forward lookup of an ENS name to an Ethereum address.
         ///
         /// Routes through the [Universal Resolver], which handles wildcard resolvers
-        /// and CCIP Read (ERC-3668) for L2 and offchain names.
+        /// and CCIP Read (ERC-3668).
         ///
         /// [Universal Resolver]: https://docs.ens.domains/web/ensv2-readiness
         async fn resolve_name(&self, name: &str) -> Result<Address, EnsError>;
@@ -258,8 +251,8 @@ mod provider {
         ///
         /// Returns the raw address bytes as stored in the resolver. The encoding varies
         /// by coin type: 20 raw address bytes for EVM chains, script bytes for
-        /// Bitcoin, etc. Use constants in [`coin_type`][crate::coin_type] or
-        /// [`coin_type::evm_chain`][crate::coin_type::evm_chain] for common coin types.
+        /// Bitcoin, etc. Use [`coin_type::evm_chain`][crate::coin_type::evm_chain] for
+        /// EVM chains; for non-EVM chains, pass the static SLIP-0044 coin type.
         async fn resolve_name_for_coin_type(
             &self,
             name: &str,
@@ -332,12 +325,9 @@ mod provider {
         }
 
         async fn lookup_address(&self, address: &Address) -> Result<String, EnsError> {
-            let reverse_name = reverse_address(address);
-            let dns = dns_encode(&reverse_name)?;
-
             let ur = UniversalResolver::new(ENS_UNIVERSAL_RESOLVER_ADDRESS, self);
             let ret = ur
-                .reverse(dns.into(), U256::from(coin_type::ETH))
+                .reverse(Bytes::copy_from_slice(address.as_slice()), U256::from(coin_type::ETH))
                 .call()
                 .await
                 .map_err(EnsError::Lookup)?;
@@ -395,9 +385,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_coin_type_evm_chain_invalid() {
-        coin_type::evm_chain(0x8000_0000);
+    fn test_coin_type_evm_chain_does_not_reject_high_bit() {
+        assert_eq!(coin_type::evm_chain(0x8000_0000), 0x8000_0000);
     }
 }
 
@@ -410,7 +399,7 @@ mod provider_tests {
     #[tokio::test]
     async fn test_pub_resolver_fetching_mainnet() {
         let provider = ProviderBuilder::new()
-            .connect_http("https://reth-ethereum.ithaca.xyz/rpc".parse().unwrap());
+            .connect_http("https://ethereum.reth.rs/rpc".parse().unwrap());
 
         let res = provider.get_resolver("vitalik.eth").await;
         assert_eq!(*res.unwrap().address(), address!("0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63"));
@@ -419,19 +408,19 @@ mod provider_tests {
     #[tokio::test]
     async fn test_pub_resolver_text() {
         let provider = ProviderBuilder::new()
-            .connect_http("https://reth-ethereum.ithaca.xyz/rpc".parse().unwrap());
+            .connect_http("https://ethereum.reth.rs/rpc".parse().unwrap());
 
         let name = "vitalik.eth";
         let node = namehash(name);
         let res = provider.get_resolver(name).await.unwrap();
-        let txt = res.text(node, "avatar".to_string()).call().await.unwrap();
-        assert_eq!(txt, "https://euc.li/vitalik.eth")
+        let text = res.text(node, "avatar".to_string()).call().await.unwrap();
+        assert_eq!(text, "https://euc.li/vitalik.eth")
     }
 
     #[tokio::test]
-    async fn test_pub_resolver_fetching_txt() {
+    async fn test_pub_resolver_fetching_text() {
         let provider = ProviderBuilder::new()
-            .connect_http("https://reth-ethereum.ithaca.xyz/rpc".parse().unwrap());
+            .connect_http("https://ethereum.reth.rs/rpc".parse().unwrap());
 
         let res = provider.lookup_txt("vitalik.eth", "avatar").await.unwrap();
         assert_eq!(res, "https://euc.li/vitalik.eth")
@@ -440,9 +429,39 @@ mod provider_tests {
     #[tokio::test]
     async fn test_universal_resolver_integration() {
         let provider = ProviderBuilder::new()
-            .connect_http("https://reth-ethereum.ithaca.xyz/rpc".parse().unwrap());
+            .connect_http("https://ethereum.reth.rs/rpc".parse().unwrap());
 
         let res = provider.resolve_name("ur.integration-tests.eth").await.unwrap();
         assert_eq!(res, address!("0x2222222222222222222222222222222222222222"));
+    }
+
+    #[tokio::test]
+    async fn test_multicoin_resolver_integration() {
+        let provider = ProviderBuilder::new()
+            .connect_http("https://ethereum.reth.rs/rpc".parse().unwrap());
+
+        let res = provider
+            .resolve_name_for_coin_type(
+                "coins.integration-tests.eth",
+                coin_type::evm_chain(8453),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.as_ref(),
+            address!("0xa66E90D515F576f49Af2dF40952476D56F72A420").as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reverse_resolver_integration() {
+        let provider = ProviderBuilder::new()
+            .connect_http("https://ethereum.reth.rs/rpc".parse().unwrap());
+
+        let res = provider
+            .lookup_address(&address!("0xeE9eeaAB0Bb7D9B969D701f6f8212609EDeA252E"))
+            .await
+            .unwrap();
+        assert_eq!(res, "devrel.enslabs.eth");
     }
 }
