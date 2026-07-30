@@ -11,6 +11,7 @@ use futures::future::BoxFuture as CcipFuture;
 #[cfg(target_family = "wasm")]
 use futures::future::LocalBoxFuture as CcipFuture;
 use futures::{stream, StreamExt};
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -18,6 +19,8 @@ use std::sync::{
 };
 
 const BATCH_GATEWAY_SENTINEL: &str = "x-batch-gateway:true";
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 mod abi {
     use super::*;
@@ -59,8 +62,12 @@ pub struct CcipReadConfig {
     pub max_batch_size: usize,
     /// Maximum aggregate gateway concurrency, including nested ENSIP-21 batches.
     pub max_concurrent_requests: usize,
-    /// Maximum total number of gateway requests, including nested batches.
+    /// Maximum total gateway URL attempts and batch nodes reserved for one call.
     pub max_total_requests: usize,
+    /// Maximum number of fallback gateway URLs accepted in one request.
+    pub max_gateway_urls: usize,
+    /// Maximum accepted `OffchainLookup` revert data size in bytes.
+    pub max_revert_data_size: usize,
     /// Maximum accepted gateway response size in bytes.
     pub max_response_size: usize,
 }
@@ -72,6 +79,8 @@ impl Default for CcipReadConfig {
             max_batch_size: 50,
             max_concurrent_requests: 4,
             max_total_requests: 100,
+            max_gateway_urls: 8,
+            max_revert_data_size: 1_048_576,
             max_response_size: 1_048_576,
         }
     }
@@ -112,6 +121,7 @@ impl CcipReadGatewayError {
 
 /// Errors produced while executing a CCIP Read call.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CcipReadError {
     /// The underlying `eth_call` failed without a valid `OffchainLookup` revert.
     #[error(transparent)]
@@ -142,6 +152,9 @@ pub enum CcipReadError {
     /// The CCIP Read client configuration is invalid.
     #[error("invalid CCIP Read configuration: {0}")]
     InvalidConfig(String),
+    /// A CCIP Read resource limit was exceeded.
+    #[error("CCIP Read resource limit exceeded: {0}")]
+    ResourceLimit(String),
 }
 
 /// Executes individual CCIP Read HTTP gateway requests.
@@ -158,14 +171,16 @@ pub trait CcipReadGateway: Send + Sync {
 
 /// The default HTTPS implementation of [`CcipReadGateway`].
 #[derive(Clone, Debug)]
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 pub struct HttpCcipReadGateway {
     client: reqwest::Client,
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 impl Default for HttpCcipReadGateway {
     fn default() -> Self {
+        #[cfg(not(target_family = "wasm"))]
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 10 {
                     attempt.stop()
@@ -177,10 +192,13 @@ impl Default for HttpCcipReadGateway {
             }))
             .build()
             .expect("default CCIP Read HTTP client configuration is valid");
+        #[cfg(target_family = "wasm")]
+        let client = reqwest::Client::new();
         Self { client }
     }
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 impl HttpCcipReadGateway {
     /// Creates a gateway handler using an existing HTTP client.
     ///
@@ -192,18 +210,21 @@ impl HttpCcipReadGateway {
 }
 
 #[derive(Serialize)]
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 struct GatewayRequestBody<'a> {
     sender: &'a str,
     data: &'a str,
 }
 
 #[derive(Deserialize)]
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 struct GatewayResponse {
     data: Bytes,
 }
 
 #[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 impl CcipReadGateway for HttpCcipReadGateway {
     async fn request(
         &self,
@@ -237,10 +258,11 @@ impl CcipReadGateway for HttpCcipReadGateway {
             };
 
             let response = if has_data_placeholder {
-                self.client.get(parsed).send().await
+                self.client.get(parsed).timeout(HTTP_REQUEST_TIMEOUT).send().await
             } else {
                 self.client
                     .post(parsed)
+                    .timeout(HTTP_REQUEST_TIMEOUT)
                     .json(&GatewayRequestBody { sender: &sender, data: &data })
                     .send()
                     .await
@@ -340,6 +362,27 @@ impl CcipReadGateway for HttpCcipReadGateway {
     }
 }
 
+/// Placeholder gateway for WASI Preview 1, where the `reqwest` transport is unavailable.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
+pub struct HttpCcipReadGateway;
+
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
+impl CcipReadGateway for HttpCcipReadGateway {
+    async fn request(
+        &self,
+        _request: &CcipReadRequest,
+        _max_response_size: usize,
+    ) -> Result<Bytes, CcipReadGatewayError> {
+        Err(CcipReadGatewayError::new(
+            "the default CCIP Read HTTP gateway is unavailable on WASI Preview 1",
+        ))
+    }
+}
+
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 fn response_message(body: &[u8]) -> String {
     const LIMIT: usize = 1_024;
     let body = &body[..body.len().min(LIMIT)];
@@ -413,7 +456,9 @@ impl<G: CcipReadGateway> CcipReadClient<G> {
             match provider.call(transaction.clone()).block(block).await {
                 Ok(result) => return Ok(result),
                 Err(error) => {
-                    let Some(revert) = extract_offchain_lookup(&error) else {
+                    let Some(revert) =
+                        extract_offchain_lookup(&error, self.config.max_revert_data_size)?
+                    else {
                         return Err(CcipReadError::Transport(error));
                     };
                     if redirects == self.config.max_redirects {
@@ -462,17 +507,35 @@ impl<G: CcipReadGateway> CcipReadClient<G> {
                     "max_concurrent_requests must be greater than zero".into(),
                 ));
             }
-            reserve_request(context)?;
-            if request.urls.iter().any(|url| url == BATCH_GATEWAY_SENTINEL) {
+            let is_batch = request.urls.iter().any(|url| url == BATCH_GATEWAY_SENTINEL);
+            if is_batch {
+                reserve_requests(context, 1)?;
                 self.local_batch(request.data, context).await
             } else {
+                if request.urls.len() > context.config.max_gateway_urls {
+                    return Err(CcipReadError::ResourceLimit(format!(
+                        "gateway URL count {} exceeds limit {}",
+                        request.urls.len(),
+                        context.config.max_gateway_urls
+                    )));
+                }
+                reserve_requests(context, request.urls.len().max(1))?;
                 let _permit = context.concurrency.acquire().await.map_err(|_| {
                     CcipReadError::InvalidBatch("gateway concurrency limiter closed".into())
                 })?;
-                self.gateway
+                let response = self
+                    .gateway
                     .request(&request, context.config.max_response_size)
                     .await
-                    .map_err(Into::into)
+                    .map_err(CcipReadError::from)?;
+                if response.len() > context.config.max_response_size {
+                    return Err(CcipReadError::ResourceLimit(format!(
+                        "gateway response is {} bytes; limit is {}",
+                        response.len(),
+                        context.config.max_response_size
+                    )));
+                }
+                Ok(response)
             }
         })
     }
@@ -537,10 +600,33 @@ impl<G: CcipReadGateway> CcipReadClient<G> {
     }
 }
 
-fn extract_offchain_lookup(error: &TransportError) -> Option<Bytes> {
-    let raw = error.as_error_resp()?.data.as_ref()?;
-    let value: serde_json::Value = serde_json::from_str(raw.get()).ok()?;
-    find_offchain_lookup(&value)
+fn extract_offchain_lookup(
+    error: &TransportError,
+    max_revert_data_size: usize,
+) -> Result<Option<Bytes>, CcipReadError> {
+    let Some(raw) = error.as_error_resp().and_then(|payload| payload.data.as_ref()) else {
+        return Ok(None);
+    };
+    let max_json_size = max_revert_data_size.saturating_mul(2).saturating_add(4_096);
+    if raw.get().len() > max_json_size {
+        // Avoid parsing and allocating an oversized, untrusted JSON-RPC error. Since its selector
+        // cannot be established within the configured bound, preserve it as the original
+        // transport error rather than misclassifying it as CCIP Read.
+        return Ok(None);
+    }
+    let Ok(value) = serde_json::from_str(raw.get()) else {
+        return Ok(None);
+    };
+    let Some(data) = find_offchain_lookup(&value) else {
+        return Ok(None);
+    };
+    if data.len() > max_revert_data_size {
+        return Err(CcipReadError::ResourceLimit(format!(
+            "OffchainLookup revert data is {} bytes; limit is {max_revert_data_size}",
+            data.len()
+        )));
+    }
+    Ok(Some(data))
 }
 
 fn find_offchain_lookup(value: &serde_json::Value) -> Option<Bytes> {
@@ -550,6 +636,7 @@ fn find_offchain_lookup(value: &serde_json::Value) -> Option<Bytes> {
             data.starts_with(abi::OffchainLookup::SELECTOR.as_slice()).then_some(data)
         }
         serde_json::Value::Object(values) => values.values().find_map(find_offchain_lookup),
+        serde_json::Value::Array(values) => values.iter().find_map(find_offchain_lookup),
         _ => None,
     }
 }
@@ -560,11 +647,16 @@ struct BatchContext<'a> {
     config: &'a CcipReadConfig,
 }
 
-fn reserve_request(context: &BatchContext<'_>) -> Result<(), CcipReadError> {
-    let count = context.total_requests.fetch_add(1, Ordering::Relaxed) + 1;
-    if count > context.config.max_total_requests {
-        return Err(CcipReadError::InvalidBatch(format!(
-            "total gateway request limit of {} exceeded",
+fn reserve_requests(context: &BatchContext<'_>, count: usize) -> Result<(), CcipReadError> {
+    if context
+        .total_requests
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(count).filter(|next| *next <= context.config.max_total_requests)
+        })
+        .is_err()
+    {
+        return Err(CcipReadError::ResourceLimit(format!(
+            "total gateway request budget of {} exceeded",
             context.config.max_total_requests
         )));
     }
@@ -671,6 +763,24 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct BatchMockGateway;
+
+    #[async_trait::async_trait]
+    impl CcipReadGateway for BatchMockGateway {
+        async fn request(
+            &self,
+            request: &CcipReadRequest,
+            _max_response_size: usize,
+        ) -> Result<Bytes, CcipReadGatewayError> {
+            match request.data.as_ref() {
+                [1] => Ok(bytes!("aaaa")),
+                [2] => Err(CcipReadGatewayError::http(404, "not found")),
+                _ => Err(CcipReadGatewayError::new("unexpected request")),
+            }
+        }
+    }
+
     fn revert_error(data: Bytes) -> ErrorPayload {
         ErrorPayload::internal_error_with_message_and_obj(
             "call failed".into(),
@@ -751,6 +861,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_excessive_gateway_url_list() {
+        let target = address!("1111111111111111111111111111111111111111");
+        let revert: Bytes = abi::OffchainLookup {
+            sender: target,
+            urls: vec!["https://example.test/{data}".into(); 9],
+            callData: Bytes::new(),
+            callbackFunction: fixed_bytes!("12345678"),
+            extraData: Bytes::new(),
+        }
+        .abi_encode()
+        .into();
+
+        let asserter = Asserter::new();
+        asserter.push_failure(revert_error(revert));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let gateway = MockGateway::default();
+
+        let error = CcipReadClient::new(gateway.clone())
+            .call(&provider, TransactionRequest::default().to(target))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CcipReadError::ResourceLimit(message) if message.contains("URL")));
+        assert!(gateway.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enforces_response_limit_for_custom_gateways() {
+        let target = address!("1111111111111111111111111111111111111111");
+        let revert: Bytes = abi::OffchainLookup {
+            sender: target,
+            urls: vec!["https://example.test/{data}".into()],
+            callData: Bytes::new(),
+            callbackFunction: fixed_bytes!("12345678"),
+            extraData: Bytes::new(),
+        }
+        .abi_encode()
+        .into();
+
+        let asserter = Asserter::new();
+        asserter.push_failure(revert_error(revert));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let gateway = MockGateway::with_responses([Ok(bytes!("0102"))]);
+        let config = CcipReadConfig { max_response_size: 1, ..Default::default() };
+
+        let error = CcipReadClient::new(gateway)
+            .with_config(config)
+            .call(&provider, TransactionRequest::default().to(target))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CcipReadError::ResourceLimit(message) if message.contains("response"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_revert_data_before_decoding() {
+        let target = address!("1111111111111111111111111111111111111111");
+        let revert: Bytes = abi::OffchainLookup {
+            sender: target,
+            urls: vec!["https://example.test/{data}".into()],
+            callData: bytes!("01020304"),
+            callbackFunction: fixed_bytes!("12345678"),
+            extraData: Bytes::new(),
+        }
+        .abi_encode()
+        .into();
+
+        let asserter = Asserter::new();
+        asserter.push_failure(revert_error(revert));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let config = CcipReadConfig { max_revert_data_size: 4, ..Default::default() };
+
+        let error = CcipReadClient::new(MockGateway::default())
+            .with_config(config)
+            .call(&provider, TransactionRequest::default().to(target))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CcipReadError::ResourceLimit(message) if message.contains("revert"))
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_oversized_non_ccip_rpc_errors() {
+        let target = address!("1111111111111111111111111111111111111111");
+        let asserter = Asserter::new();
+        asserter.push_failure(revert_error(vec![0u8; 5_000].into()));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let config = CcipReadConfig { max_revert_data_size: 1, ..Default::default() };
+
+        let error = CcipReadClient::new(MockGateway::default())
+            .with_config(config)
+            .call(&provider, TransactionRequest::default().to(target))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CcipReadError::Transport(_)));
+    }
+
+    #[tokio::test]
     async fn enforces_redirect_limit() {
         let target = address!("1111111111111111111111111111111111111111");
         let revert: Bytes = abi::OffchainLookup {
@@ -803,11 +1016,7 @@ mod tests {
         }
         .abi_encode()
         .into();
-        let gateway = MockGateway::with_responses([
-            Ok(bytes!("aaaa")),
-            Err(CcipReadGatewayError::http(404, "not found")),
-        ]);
-        let client = CcipReadClient::new(gateway);
+        let client = CcipReadClient::new(BatchMockGateway);
         let context = BatchContext {
             total_requests: Arc::new(AtomicUsize::new(0)),
             concurrency: Arc::new(tokio::sync::Semaphore::new(
@@ -872,6 +1081,6 @@ mod tests {
         assert!(alloy_sol_types::Revert::abi_decode(&middle.responses[0])
             .unwrap()
             .reason
-            .contains("limit"));
+            .contains("budget"));
     }
 }
