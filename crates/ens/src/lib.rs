@@ -227,9 +227,14 @@ mod contract {
         #[error("Failed to decode Universal Resolver response")]
         InvalidResponse,
         /// Failed while performing a CCIP Read request.
+        ///
+        /// Constructed only for non-transport CCIP failures. Transport errors are
+        /// mapped to [`EnsError::Resolve`], [`EnsError::Lookup`], or
+        /// [`EnsError::ResolveTxtRecord`] via context-aware helpers — do not use
+        /// `EnsError::from(CcipReadError)`.
         #[cfg(feature = "provider")]
         #[error("Failed to perform CCIP Read: {0}")]
-        CcipRead(#[from] alloy_provider::CcipReadError),
+        CcipRead(#[source] alloy_provider::CcipReadError),
     }
 }
 
@@ -240,6 +245,7 @@ mod provider {
         EnsResolver, EnsResolver::EnsResolverInstance, UniversalResolver,
         UNIVERSAL_RESOLVER_ADDRESS,
     };
+    use alloy_eips::BlockId;
     use alloy_primitives::{Address, Bytes, U256};
     use alloy_provider::{CcipReadError, Network, Provider, ProviderCcipReadExt};
     use alloy_sol_types::{SolCall, SolValue};
@@ -322,7 +328,7 @@ mod provider {
                 .resolve(dns.into(), calldata.into())
                 .into_transaction_request();
             let output = self
-                .call_with_ccip_read(transaction)
+                .call_with_ccip_read_at(transaction, BlockId::latest())
                 .await
                 .map_err(|error| map_ccip_error(error, name, EnsError::Resolve))?;
             let ret = UniversalResolver::resolveCall::abi_decode_returns(&output)
@@ -348,7 +354,7 @@ mod provider {
                 .resolve(dns.into(), calldata.into())
                 .into_transaction_request();
             let output = self
-                .call_with_ccip_read(transaction)
+                .call_with_ccip_read_at(transaction, BlockId::latest())
                 .await
                 .map_err(|error| map_ccip_error(error, name, EnsError::Resolve))?;
             let ret = UniversalResolver::resolveCall::abi_decode_returns(&output)
@@ -363,7 +369,7 @@ mod provider {
                 .reverse(Bytes::copy_from_slice(address.as_slice()), U256::from(coin_type::ETH))
                 .into_transaction_request();
             let output = self
-                .call_with_ccip_read(transaction)
+                .call_with_ccip_read_at(transaction, BlockId::latest())
                 .await
                 .map_err(|error| map_ccip_error(error, &reverse_name, EnsError::Lookup))?;
             let ret = UniversalResolver::reverseCall::abi_decode_returns(&output)
@@ -381,7 +387,7 @@ mod provider {
                 .resolve(dns.into(), calldata.into())
                 .into_transaction_request();
             let output = self
-                .call_with_ccip_read(transaction)
+                .call_with_ccip_read_at(transaction, BlockId::latest())
                 .await
                 .map_err(|error| map_ccip_error(error, name, EnsError::ResolveTxtRecord))?;
             let ret = UniversalResolver::resolveCall::abi_decode_returns(&output)
